@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"golang.org/x/crypto/nacl/box"
 )
 
 const psk = "MySecretPassword"
@@ -25,10 +27,9 @@ func main() {
 	fmt.Println("=== SERVER STARTED ===")
 	fmt.Println("Server Identity (Ed25519 Public Key):")
 	fmt.Println(hex.EncodeToString(pub))
-	fmt.Println("(Note: Since we restarted, this key CHANGED. Client verification will fail later, but step 7 works now.)")
+	fmt.Println("!!! COPY THIS KEY TO CLIENT NOW !!!")
 	fmt.Println()
 
-	// 2. Слушаем порт
 	listener, err := net.Listen("tcp", ":9000")
 	if err != nil {
 		panic(err)
@@ -44,68 +45,90 @@ func main() {
 			continue
 		}
 
-		// Обрабатываем подключение
-		handleConnection(conn)
+		// Запускаем обработку клиента в отдельной горутине, чтобы не блокировать остальных
+		go handleConnection(conn, priv)
 	}
-
-	// Чтобы компилятор не ругался
-	_ = priv
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, serverEdPriv ed25519.PrivateKey) {
 	defer conn.Close()
 	fmt.Println("\nClient connected:", conn.RemoteAddr())
 
-	// --- ЧТЕНИЕ ПАКЕТА (Client Hello) ---
-	// Мы знаем, что пакет должен быть ровно 72 байта
-	// [ Time (8) ] + [ ClientPub (32) ] + [ HMAC (32) ]
-
+	// --- 1. ЧТЕНИЕ (Client Hello) ---
 	buffer := make([]byte, 72)
-
-	// io.ReadFull гарантирует, что мы прочитаем ровно 72 байта или вернем ошибку
-	_, err := io.ReadFull(conn, buffer)
-	if err != nil {
+	if _, err := io.ReadFull(conn, buffer); err != nil {
 		fmt.Println("Error reading packet:", err)
 		return
 	}
-	fmt.Println("Received 72 bytes from client.")
 
-	// --- РАЗБОР ПАКЕТА ---
-	// Режем колбасу
-	payload := buffer[:40]           // Данные (время + ключ)
-	receivedSignature := buffer[40:] // Печать клиента
+	// --- 2. ПРОВЕРКА (HMAC) ---
+	payload := buffer[:40]
+	receivedSignature := buffer[40:]
 
-	// --- ПРОВЕРКА HMAC (Фейс-контроль) ---
-	// Считаем, какой HMAC должен быть, если пароль PSK верный
 	mac := hmac.New(sha256.New, []byte(psk))
 	mac.Write(payload)
 	expectedSignature := mac.Sum(nil)
 
-	// Сравниваем полученный и ожидаемый HMAC
 	if !hmac.Equal(receivedSignature, expectedSignature) {
-		fmt.Println("❌ HMAC VERIFICATION FAILED! (Wrong password or tampered data)")
+		fmt.Println("❌ HMAC VERIFICATION FAILED!")
 		return
 	}
-	fmt.Println("✅ HMAC Valid. Client knows the password.")
+	fmt.Println("✅ Client HMAC Valid.")
 
-	// --- ЧТЕНИЕ ДАННЫХ ---
-	// 1. Время
-	timestamp := binary.BigEndian.Uint64(payload[:8])
-	serverTime := time.Now().Unix()
+	// --- 3. ИЗВЛЕЧЕНИЕ ДАННЫХ ---
+	clientTimestamp := binary.BigEndian.Uint64(payload[:8])
+	clientPub := payload[8:40] // [32]byte
 
-	fmt.Printf("Client Timestamp: %d (Server Time: %d)\n", timestamp, serverTime)
+	// Превращаем срез в массив [32]byte для X25519
+	var clientPubArr [32]byte
+	copy(clientPubArr[:], clientPub)
 
-	// Простейшая проверка времени (чтобы пакет не был из далекого прошлого)
-	// Допустим, разница не более 60 секунд
-	timeDiff := int64(serverTime) - int64(timestamp)
-	if timeDiff > 60 || timeDiff < -60 {
-		fmt.Println("⚠️ Timestamp is too old or in future!")
-		// return // в реальном коде здесь разрыв соединения
+	fmt.Printf("Client Timestamp: %d\n", clientTimestamp)
+	fmt.Printf("Client Ephemeral Key: %x...\n", clientPubArr[:5])
+
+	// --- ШАГ 8: ФОРМИРОВАНИЕ ОТВЕТА (Server Hello) ---
+
+	// А. Генерируем ВРЕМЕННЫЙ ключ сервера (X25519)
+	serverPub, serverPriv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		fmt.Println("Key generation error:", err)
+		return
 	}
 
-	// 2. Ключ клиента (X25519)
-	clientPub := payload[8:40]
-	fmt.Printf("Client Ephemeral Key: %x...\n", clientPub[:5])
+	// Б. ВРЕМЯ (8 байт)
+	serverTime := time.Now().Unix()
+	serverTimeBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(serverTimeBuf, uint64(serverTime))
 
-	fmt.Println("Step 7 Complete: Client packet accepted.")
+	// В. ПОДПИСЬ (Ed25519) - Доказываем, что мы настоящий сервер
+	// Подписываем: [ ClientPub (32) ] + [ ServerPub (32) ]
+	// Это связывает ответ сервера с конкретным запросом клиента
+	signatureMessage := append(clientPubArr[:], serverPub[:]...)
+	signature := ed25519.Sign(serverEdPriv, signatureMessage) // 64 байта
+
+	// Г. СБОРКА PAYLOAD (104 байта)
+	// [ Time (8) ] + [ ServerPub (32) ] + [ Signature (64) ]
+	serverPayload := append(serverTimeBuf, serverPub[:]...)
+	serverPayload = append(serverPayload, signature...)
+
+	// Д. HMAC (Печать PSK) - Скрываем ответ
+	mac2 := hmac.New(sha256.New, []byte(psk))
+	mac2.Write(serverPayload)
+	serverHMAC := mac2.Sum(nil) // 32 байта
+
+	// Е. ИТОГОВЫЙ ПАКЕТ (136 байт)
+	serverPacket := append(serverPayload, serverHMAC...)
+
+	fmt.Printf("Sending Server Hello (%d bytes)...\n", len(serverPacket))
+
+	// Ж. ОТПРАВКА
+	if _, err := conn.Write(serverPacket); err != nil {
+		fmt.Println("Error sending packet:", err)
+		return
+	}
+
+	fmt.Println("Server Hello SENT! Handshake almost complete on server side.")
+
+	// Чтобы компилятор не ругался
+	_ = serverPriv
 }
