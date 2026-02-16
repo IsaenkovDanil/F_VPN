@@ -12,6 +12,8 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/box"
 )
 
@@ -129,6 +131,25 @@ func handleConnection(conn net.Conn, serverEdPriv ed25519.PrivateKey) {
 
 	fmt.Println("Server Hello SENT! Handshake almost complete on server side.")
 
-	// Чтобы компилятор не ругался
-	_ = serverPriv
+	// --- ФИНАЛЬНЫЙ ШАГ: ВЫЧИСЛЕНИЕ КЛЮЧЕЙ (ECDH) ---
+
+	// Магия Диффи-Хеллмана:
+	// СЕРВЕР берет: СВОЙ Секрет + ПУБЛИЧНЫЙ Ключ Клиента
+	var sharedSecret [32]byte
+	curve25519.ScalarMult(&sharedSecret, serverPriv, &clientPubArr)
+
+	// HKDF: Создаем те же ключи
+	hash := sha256.New
+	kdf := hkdf.New(hash, sharedSecret[:], nil, nil)
+
+	// ВАЖНО: Порядок должен быть таким же, как у клиента
+	keyClientToServer := make([]byte, 32)
+	keyServerToClient := make([]byte, 32)
+
+	io.ReadFull(kdf, keyClientToServer)
+	io.ReadFull(kdf, keyServerToClient)
+
+	fmt.Println("\n🎉 SERVER HANDSHAKE COMPLETE!")
+	fmt.Printf("🔑 Key Client->Server: %x\n", keyClientToServer)
+	fmt.Printf("🔑 Key Server->Client: %x\n", keyServerToClient)
 }
