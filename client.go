@@ -12,6 +12,8 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/box"
 )
 
@@ -80,15 +82,18 @@ func main() {
 
 	// --- 6. РАЗБОР ДАННЫХ ---
 	serverTime := binary.BigEndian.Uint64(serverPayload[:8])
-	serverPub := serverPayload[8:40]   // Временный ключ сервера (для шифрования)
-	serverSig := serverPayload[40:104] // Подпись (для проверки личности)
+	serverPubSlice := serverPayload[8:40] // Временный ключ сервера (для шифрования)
+	serverSig := serverPayload[40:104]    // Подпись (для проверки личности)
 
 	fmt.Printf("Server Time: %d\n", serverTime)
 
+	// Превращаем slice в массив [32]byte (нужно для математики)
+	var serverPubArr [32]byte
+	copy(serverPubArr[:], serverPubSlice)
 	// --- 7. ПРОВЕРКА ПОДПИСИ (САМОЕ ВАЖНОЕ!) ---
 	// Сервер подписывал: [ ClientPub ] + [ ServerPub ]
 	// Мы должны собрать те же данные и проверить подпись "Паспортом"
-	verifyMsg := append(clientPub[:], serverPub...)
+	verifyMsg := append(clientPub[:], serverPubSlice...)
 
 	isValid := ed25519.Verify(serverEdPubKey, verifyMsg, serverSig)
 
@@ -97,7 +102,34 @@ func main() {
 	}
 
 	fmt.Println("✅ SERVER IDENTITY VERIFIED! This is the real server.")
-	fmt.Println("Step 9 Complete: Handshake Validated.")
+
+	// --- 8. МАГИЯ: ВЫЧИСЛЕНИЕ ОБЩЕГО СЕКРЕТА (ECDH) ---
+	// Мы берем: НАШ Приватный ключ + ЕГО Публичный ключ
+	// Результат: Shared Secret (32 байта)
+	var sharedSecret [32]byte
+	curve25519.ScalarMult(&sharedSecret, clientPriv, &serverPubArr)
+
+	fmt.Printf("🔹 SHARED SECRET (Internal): %x...\n", sharedSecret[:5])
+
+	// --- 9. HKDF: СОЗДАНИЕ КЛЮЧЕЙ ШИФРОВАНИЯ ---
+	// Превращаем "сырой" секрет в два красивых ключа
+	hash := sha256.New
+	kdf := hkdf.New(hash, sharedSecret[:], nil, nil)
+
+	// Нам нужно 2 ключа по 32 байта (AES-256)
+	// 1. Ключ для отправки (Client -> Server)
+	// 2. Ключ для приема (Server -> Client)
+	keyWriter := make([]byte, 32)
+	keyReader := make([]byte, 32)
+
+	io.ReadFull(kdf, keyWriter)
+	io.ReadFull(kdf, keyReader)
+
+	fmt.Println("\n🎉 HANDSHAKE COMPLETE! KEYS GENERATED:")
+	fmt.Printf("🔑 Key Client->Server: %x\n", keyWriter)
+	fmt.Printf("🔑 Key Server->Client: %x\n", keyReader)
+
+	// Теперь мы можем использовать эти ключи для шифрования реальных данных!
 
 	// Чтобы компилятор не ругался
 	_ = clientPriv
