@@ -16,7 +16,7 @@ import (
 
 // 1. Публичный ключ сервера (ПАСПОРТ)
 // !!! ВСТАВЬ СЮДА ТОТ ЖЕ КЛЮЧ, ЧТО БЫЛ РАНЬШЕ !!!
-const serverEdPublicKeyHex = "ВСТАВЬ_СЮДА_КЛЮЧ_СЕРВЕРА_ИЗ_ШАГА_3"
+const serverEdPublicKeyHex = "ac3d0961fae54109a3b1941ded140140d1bac6514dc71e4ac8d9a20ed9a3592e"
 
 // 2. Наш общий пароль (PSK)
 const psk = "MySecretPassword"
@@ -53,7 +53,7 @@ func main() {
 	// Б. PAYLOAD (Время + Публичный Ключ)
 	// payload = [ time (8) ] + [ clientPub (32) ]
 	payload := append(timeBuf, clientPub[:]...)
-
+	fmt.Printf("Client Ephemeral Key: %x...\n", clientPub[:5])
 	// В. HMAC (Печать PSK)
 	// Берем пароль, считаем хеш от payload
 	mac := hmac.New(sha256.New, []byte(psk))
