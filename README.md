@@ -1,217 +1,171 @@
-# F_VPN: server3/client3 (WebSocket + TLS + padding + probe-resistance)
+# F_VPN v3 (WS+TLS+uTLS+TUN+NAT+Rekey)
 
-Этот README описывает новый учебный контур `server3.go` + `client3.go`:
+Ниже реализован запрошенный апгрейд:
 
-- транспорт: **WebSocket over TLS (wss://)**;
-- маскировка: сервер отвечает обычной HTML-страницей на `/`;
-- доступ к VPN-каналу только на секретном WebSocket пути (например `/my-vpn-uuid`);
-- авторизация по PSK + HMAC + timestamp + nonce;
-- защита от replay (повтор nonce);
-- шифрование полезной нагрузки: AES-256-GCM;
-- padding (случайный мусор до `max-padding` байт в кадре).
-
-> Важно: это учебная реализация уровня «прототип архитектуры». Здесь нет полноценного TUN forwarding. Сейчас клиент отправляет сообщения из stdin, сервер делает encrypted echo. Это база для следующего шага: подмена stdin на чтение/запись TUN.
+1. `client3.go`: **stdin/stdout убран**, теперь цикл **TUN <-> WSS**.
+2. `server3.go`: зеркальный packet loop (**WSS <-> TUN**) + опциональный автозапуск NAT/forward.
+3. Протокол вынесен в отдельный пакет `vpn3proto`.
+4. Добавлена ротация ключей сессии (каждые N пакетов, с control-frame rekey).
+5. Добавлен Cloudflare-friendly режим: порт `443`, проверка `Host`, валидный cert/key.
 
 ---
 
-## 1) Что добавлено
+## Что важно понимать
 
-- `server3.go` — HTTPS сервер + WebSocket endpoint + fallback page + auth + replay guard + encrypted echo.
-- `client3.go` — WSS клиент на `gorilla/websocket` + uTLS ClientHello (Chrome mimic) + auth + encrypted exchange.
-- `vpn3_protocol.go` — общее протокольное ядро (auth, key derivation, padding, encrypt/decrypt).
-- `vpn3_protocol_test.go` — базовые тесты для auth/padding/crypto.
+Это уже архитектура VPN-транспорта (VLESS/Trojan-style путь):
+- tunnel transport: `WebSocket over TLS`;
+- uTLS (клиент маскируется под Chrome Hello);
+- fallback HTTP-страница на `/`;
+- секретный WS path на `/<uuid-like-path>`;
+- PSK auth + replay guard + padding + encryption.
 
----
-
-## 2) Можно ли проверять `server.go`/`server3.go` только на Linux или в Windows WSL2 тоже?
-
-Коротко: **WSL2 тоже можно и это нормальный вариант**.
-
-- Для серверной части (`server.go`, `server3.go`) Linux и WSL2 практически одинаковы с точки зрения сети/Go.
-- Для production VPS всё равно целевой сценарий — Linux.
-- Для локальной разработки на Windows оптимально:
-  - сервер запускать в **WSL2 Ubuntu**,
-  - клиент можно запускать и в WSL2, и в PowerShell (при наличии Go и зависимостей).
-
-Если используешь TUN-часть в будущем:
-- Linux TUN проще поднимать в Linux/WSL2.
-- Нативный Windows TUN требует отдельной работы с Wintun и правами администратора.
+Но это всё ещё **учебный прототип**. Для production нужны: строгий ACL, лимиты, метрики, алерты, fail2ban/WAF policy, rotation policy с подтверждением, hardening CI/CD.
 
 ---
 
-## 3) Быстрый запуск на Linux/WSL2
+## Файлы
 
-## 3.1 Подготовка TLS сертификата для локального теста
+- `server3.go` — сервер 443, WS endpoint, TUN, NAT опционально.
+- `client3.go` — клиент WS/uTLS, TUN loop.
+- `vpn3proto/protocol.go` — общий протокол.
+- `vpn3proto/protocol_test.go` — unit тесты.
 
-В каталоге проекта:
+---
+
+## Можно ли проверять `server.go/server3.go` в WSL2?
+
+Да, **можно**. Для дев-сценария WSL2 отлично подходит.
+
+- Проверка серверной логики на WSL2 валидна.
+- Боевой запуск на VPS — Linux.
+- Для TUN/NAT в WSL2 нужен root и корректные сетевые настройки WSL2.
+
+---
+
+## Быстрый запуск (Linux/WSL2)
+
+## 1) Подготовь сертификат (локально)
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout dev.key -out dev.crt -days 365 \
-  -subj "/CN=127.0.0.1"
+  -subj "/CN=your-domain.example"
 ```
 
-## 3.2 Запуск сервера
+## 2) Сервер: поднять TUN + NAT + WSS
 
 ```bash
-go run server3.go vpn3_protocol.go \
-  -addr :8443 \
+sudo go run server3.go \
+  -addr :443 \
   -ws-path /my-vpn-uuid \
-  -psk 'strong-dev-psk' \
+  -psk 'change-this-very-long-psk' \
   -cert ./dev.crt \
   -key ./dev.key \
-  -max-padding 100
+  -expected-host your-domain.example \
+  -tun-name vpn3s \
+  -max-padding 120 \
+  -rotate-every 500 \
+  -auto-nat \
+  -out-iface eth0 \
+  -tun-cidr 10.66.0.0/24
 ```
 
-Проверка fallback страницы:
+После старта назначь IP серверному TUN:
 
 ```bash
-curl -k https://127.0.0.1:8443/
+sudo ip addr add 10.66.0.1/24 dev vpn3s
+sudo ip link set vpn3s up
 ```
 
-## 3.3 Запуск клиента
+## 3) Клиент: TUN + WSS
 
 ```bash
-go run client3.go vpn3_protocol.go \
-  -url wss://127.0.0.1:8443/my-vpn-uuid \
-  -psk 'strong-dev-psk' \
-  -insecure
+sudo go run client3.go \
+  -url wss://your-domain.example/my-vpn-uuid \
+  -psk 'change-this-very-long-psk' \
+  -tun-name vpn3c \
+  -max-padding 120 \
+  -rotate-every 500
 ```
 
-Введи текст и нажми Enter, должен прийти ответ `echo:<текст>`.
-
----
-
-## 4) Подробные инструкции для Windows
-
-Ниже 2 рабочих варианта.
-
-## Вариант A (рекомендуется): Windows + WSL2 (Ubuntu)
-
-### Шаг 1. Установи WSL2
-
-В PowerShell (Admin):
-
-```powershell
-wsl --install
-```
-
-Перезагрузка, затем настрой Ubuntu.
-
-### Шаг 2. Установи Go в WSL2
-
-В Ubuntu:
+Назначь IP клиентскому TUN и маршрут:
 
 ```bash
-sudo apt update
-sudo apt install -y golang-go openssl ca-certificates
+sudo ip addr add 10.66.0.2/24 dev vpn3c
+sudo ip link set vpn3c up
+sudo ip route add default via 10.66.0.1 dev vpn3c
 ```
 
 Проверка:
 
 ```bash
-go version
+curl https://ifconfig.me
 ```
-
-### Шаг 3. Перейди в проект
-
-Если проект на диске C:
-
-```bash
-cd /mnt/c/path/to/F_VPN
-```
-
-Или клонируй проект прямо в Linux FS (`~/projects/F_VPN`) — обычно быстрее по IO.
-
-### Шаг 4. Сгенерируй dev-сертификат
-
-```bash
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout dev.key -out dev.crt -days 365 \
-  -subj "/CN=127.0.0.1"
-```
-
-### Шаг 5. Запусти сервер
-
-```bash
-go run server3.go vpn3_protocol.go -addr :8443 -ws-path /my-vpn-uuid -psk 'strong-dev-psk' -cert ./dev.crt -key ./dev.key
-```
-
-### Шаг 6. Запусти клиент (в другом окне WSL2)
-
-```bash
-go run client3.go vpn3_protocol.go -url wss://127.0.0.1:8443/my-vpn-uuid -psk 'strong-dev-psk' -insecure
-```
-
-### Шаг 7. Smoke test
-
-- В клиенте набери `hello`.
-- Ожидай `echo:hello`.
 
 ---
 
-## Вариант B: Полностью в Windows (PowerShell)
+## Подробно для Windows
 
-### Шаг 1. Установи Go for Windows
+### Вариант A (рекомендуется): Windows + WSL2 Ubuntu
 
-- Скачай installer с официального сайта Go.
-- Убедись, что `go version` работает в PowerShell.
-
-### Шаг 2. Установи OpenSSL (один из вариантов)
-
-- Git for Windows (в составе есть openssl), или
-- отдельный OpenSSL installer.
-
-### Шаг 3. Сгенерируй сертификат
-
-В PowerShell (пример с OpenSSL в PATH):
+1. Установи WSL2:
 
 ```powershell
-openssl req -x509 -newkey rsa:2048 -nodes `
-  -keyout dev.key -out dev.crt -days 365 `
-  -subj "/CN=127.0.0.1"
+wsl --install
 ```
 
-### Шаг 4. Запусти сервер
-
-```powershell
-go run .\server3.go .\vpn3_protocol.go -addr :8443 -ws-path /my-vpn-uuid -psk "strong-dev-psk" -cert .\dev.crt -key .\dev.key
-```
-
-### Шаг 5. Запусти клиент
-
-```powershell
-go run .\client3.go .\vpn3_protocol.go -url wss://127.0.0.1:8443/my-vpn-uuid -psk "strong-dev-psk" -insecure
-```
-
----
-
-## 5) Тесты
-
-Запуск unit-тестов протокольного ядра:
+2. В WSL2:
 
 ```bash
-go test vpn3_protocol_test.go vpn3_protocol.go -v
+sudo apt update
+sudo apt install -y golang-go openssl iproute2 iptables curl
+```
+
+3. Запуск делай по Linux шагам выше (в WSL2).
+
+4. Вопрос «можно ли проверять server.go в WSL2?» — **да, можно**.
+
+### Вариант B: полностью нативный Windows
+
+В этом варианте текущий `client3.go/server3.go` с `water` ориентирован на Linux/Unix TUN.
+Для нативного Windows TUN нужен отдельный вариант на Wintun (как у тебя в старых файлах), поэтому практичнее использовать **WSL2**.
+
+---
+
+## Cloudflare + валидный cert на 443 (боевой контур)
+
+1. DNS:
+- `A your-domain.example -> VPS IP`
+- В Cloudflare включить proxied (оранжевое облако).
+
+2. Сервер:
+- запусти на `:443`;
+- укажи `-expected-host your-domain.example`;
+- сертификат:
+  - либо Let's Encrypt на origin,
+  - либо Cloudflare Origin Certificate (`cert.pem/key.pem`).
+
+3. Клиент:
+- подключайся только на домен: `wss://your-domain.example/my-vpn-uuid`.
+
+4. Маскировка:
+- на `GET /` сервер отдаёт обычную веб-страницу.
+- VPN работает только на секретном пути + валидном auth.
+
+---
+
+## Тесты
+
+```bash
+go test ./vpn3proto -v
 ```
 
 ---
 
-## 6) Переход к реальному VPN дальше
+## Безопасность (обязательно)
 
-Следующий шаг (после стабилизации `server3/client3`):
-
-1. заменить stdin/stdout в `client3.go` на TUN read/write;
-2. сделать зеркальный packet loop на `server3.go` и маршрутизацию в интернет (NAT/forward);
-3. вынести протокол в отдельный пакет;
-4. добавить ротацию ключей сессии;
-5. добавить доменный фронт через Cloudflare и валидный cert на 443.
-
----
-
-## 7) Важные замечания по безопасности
-
-- Не используй `-insecure` в production.
-- PSK должен быть длинным случайным значением (32+ байта).
-- Секретный путь должен быть непредсказуемым (`/uuid-like-random-path`).
-- Нужен rate-limit на HTTP уровне (Nginx/Caddy/Cloudflare rules).
-- Для боевого режима обязательно логировать минимум данных.
+- Не используй короткий PSK.
+- Меняй WS path на случайный UUID-like.
+- Включи rate-limit на уровне Cloudflare/WAF.
+- Логи без чувствительных данных.
+- Для production добавь ротацию PSK/сертификата по расписанию.
