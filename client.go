@@ -19,7 +19,7 @@ import (
 
 // 1. ПУБЛИЧНЫЙ КЛЮЧ СЕРВЕРА (ПАСПОРТ)
 // !!! ЗАПУСТИ SERVER.GO, СКОПИРУЙ КЛЮЧ И ВСТАВЬ СЮДА !!!
-const serverEdPublicKeyHex = "144306fd37ae5cafffc967f1fb2d33867ca5e2a8fad2544605cbe64a72511540"
+const serverEdPublicKeyHex = "8b8c64d97f5e329ff4db480e5ee50b76cd0976a07eff549a6ce49e22c57b54a7"
 
 const psk = "MySecretPassword"
 
