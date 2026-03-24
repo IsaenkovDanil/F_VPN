@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Book English Tutor</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Book English Tutor</h1>
+    <div class="controls">
+      <input type="file" id="pdfInput" accept="application/pdf" />
+      <button id="uploadBtn">Загрузить PDF</button>
+      <select id="bookSelect"></select>
+      <button id="loadBookBtn">Открыть</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="pagesPanel"></aside>
+    <section id="contentPanel">
+      <h2 id="pageTitle">Выберите страницу</h2>
+      <img id="pagePreview" alt="Page preview" />
+      <div class="actions">
+        <button id="planBtn" disabled>Сгенерировать план</button>
+        <button id="lessonsBtn" disabled>Сгенерировать уроки</button>
+      </div>
+      <div id="results"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
